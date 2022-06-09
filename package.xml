@@ -28,12 +28,12 @@
 
   <build_depend>message_generation</build_depend>
   <build_depend>libaria</build_depend>
-  <build_depend>roscpp</build_depend>
+  <build_depend>rclcpp</build_depend>
   <build_depend>nav_msgs</build_depend>
   <build_depend>geometry_msgs</build_depend>
   <build_depend>sensor_msgs</build_depend>
   <build_depend>std_msgs</build_depend>
-  <build_depend>tf</build_depend>
+  <build_depend>tf2</build_depend>
   <build_depend>dynamic_reconfigure</build_depend>
   <build_depend>std_srvs</build_depend>
   <run_depend>libaria</run_depend>
