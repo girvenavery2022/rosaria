@@ -1,34 +1,78 @@
-#include <stdio.h>
-#include <math.h>
-#ifdef ADEPT_PKG
-  #include <Aria.h>
-  #include <ArRobotConfigPacketReader.h> // todo remove after ArRobotConfig implemented in AriaCoda
-#else
-  #include <Aria/Aria.h>
-  #include <Aria/ArRobotConfigPacketReader.h> // todo remove after ArRobotConfig implemented in AriaCoda
-#endif
-#include "rclcpp/rclcpp.hpp"
-#include "geometry_msgs/Twist.h"
-#include "geometry_msgs/Pose.h"
-#include "geometry_msgs/PoseStamped.h"
-#include <sensor_msgs/msg/PointCloud2.hpp>
-#include "nav_msgs/msg/Odometry.hpp"
-#include "rosaria/BumperState.h"
-#include "tf/tf.h"
-#include "tf/transform_listener.h"  //for tf::getPrefixParam
-#include <tf/transform_broadcaster.h>
-#include "tf/transform_datatypes.h"
-#include <dynamic_reconfigure/server.h>
-#include <rosaria/RosAriaConfig.h>
-#include "std_msgs/msg/Float64.hpp"
-#include "std_msgs/Float32.h"
-#include "std_msgs/Int8.h"
-#include "std_msgs/Bool.h"
-#include "std_srvs/Empty.h"
+#include "rosaria/RosAria.hpp"
 
-#include "LaserPublisher.h"
+RosAriaNode::RosAriaNode(ros::NodeHandle nh) : 
+  n(nh),
+  serial_port(""), serial_baud(0), 
+  conn(NULL), laserConnector(NULL), robot(NULL),
+  myPublishCB(this, &RosAriaNode::publish),
+  sonar_enabled(false), publish_sonar(false), publish_sonar_pointcloud2(false),
+  debug_aria(false), 
+  TicksMM(-1), DriftFactor(-99999), RevCount(-1),
+  publish_aria_lasers(false)
+{
+  // read in runtime parameters
 
-#include <sstream>
+  // port and baud
+  n.param( "port", serial_port, std::string("/dev/ttyUSB0") );
+  ROS_INFO( "RosAria: set port: [%s]", serial_port.c_str() );
+
+  n.param("baud", serial_baud, 0);
+  if(serial_baud != 0)
+    ROS_INFO("RosAria: set serial port baud rate %d", serial_baud);
+
+  // handle debugging more elegantly
+  n.param( "debug_aria", debug_aria, false ); // default not to debug
+  n.param( "aria_log_filename", aria_log_filename, std::string("Aria.log") );
+
+  // whether to connect to lasers using aria
+  n.param("publish_aria_lasers", publish_aria_lasers, false);
+
+  // Get frame_ids to use.
+  n.param("odom_frame", frame_id_odom, std::string("odom"));
+  n.param("base_link_frame", frame_id_base_link, std::string("base_link"));
+  n.param("bumpers_frame", frame_id_bumper, std::string("bumpers"));
+  n.param("sonar_frame", frame_id_sonar, std::string("sonar"));
+
+  // advertise services for data topics
+  // second argument to advertise() is queue size.
+  // other argmuments (optional) are callbacks, or a boolean "latch" flag (whether to send current data to new
+  // subscribers when they subscribe).
+  // See ros::NodeHandle API docs.
+  pose_pub = n.advertise<nav_msgs::Odometry>("pose",1000);
+  bumpers_pub = n.advertise<rosaria::BumperState>("bumper_state",1000);
+  sonar_pub = n.advertise<sensor_msgs::PointCloud>("sonar", 50, 
+      boost::bind(&RosAriaNode::sonarConnectCb, this),
+      boost::bind(&RosAriaNode::sonarConnectCb, this));
+  sonar_pointcloud2_pub = n.advertise<sensor_msgs::PointCloud2>("sonar_pointcloud2", 50,
+      boost::bind(&RosAriaNode::sonarConnectCb, this),
+      boost::bind(&RosAriaNode::sonarConnectCb, this));
+
+  voltage_pub = n.advertise<std_msgs::Float64>("battery_voltage", 1000);
+  recharge_state_pub = n.advertise<std_msgs::Int8>("battery_recharge_state", 5, true /*latch*/ );
+  recharge_state.data = -2;
+  state_of_charge_pub = n.advertise<std_msgs::Float32>("battery_state_of_charge", 100);
+
+  motors_state_pub = n.advertise<std_msgs::Bool>("motors_state", 5, true /*latch*/ );
+  motors_state.data = false;
+  published_motors_state = false;
+
+  // advertise enable/disable services
+  enable_srv = n.advertiseService("enable_motors", &RosAriaNode::enable_motors_cb, this);
+  disable_srv = n.advertiseService("disable_motors", &RosAriaNode::disable_motors_cb, this);
+  
+  veltime = ros::Time::now();
+}
+
+RosAriaNode::~RosAriaNode()
+{
+  // disable motors and sonar.
+  robot->disableMotors();
+  robot->disableSonar();
+
+  robot->stopRunning();
+  robot->waitForRunExit();
+  Aria::shutdown();
+}
 
 void RosAriaNode::readParameters()
 {
@@ -169,80 +213,6 @@ void RosAriaNode::sonarConnectCb()
     sonar_enabled = true;
   }
   robot->unlock();
-}
-
-RosAriaNode::RosAriaNode(ros::NodeHandle nh) : 
-  n(nh),
-  serial_port(""), serial_baud(0), 
-  conn(NULL), laserConnector(NULL), robot(NULL),
-  myPublishCB(this, &RosAriaNode::publish),
-  sonar_enabled(false), publish_sonar(false), publish_sonar_pointcloud2(false),
-  debug_aria(false), 
-  TicksMM(-1), DriftFactor(-99999), RevCount(-1),
-  publish_aria_lasers(false)
-{
-  // read in runtime parameters
-
-  // port and baud
-  n.param( "port", serial_port, std::string("/dev/ttyUSB0") );
-  ROS_INFO( "RosAria: set port: [%s]", serial_port.c_str() );
-
-  n.param("baud", serial_baud, 0);
-  if(serial_baud != 0)
-    ROS_INFO("RosAria: set serial port baud rate %d", serial_baud);
-
-  // handle debugging more elegantly
-  n.param( "debug_aria", debug_aria, false ); // default not to debug
-  n.param( "aria_log_filename", aria_log_filename, std::string("Aria.log") );
-
-  // whether to connect to lasers using aria
-  n.param("publish_aria_lasers", publish_aria_lasers, false);
-
-  // Get frame_ids to use.
-  n.param("odom_frame", frame_id_odom, std::string("odom"));
-  n.param("base_link_frame", frame_id_base_link, std::string("base_link"));
-  n.param("bumpers_frame", frame_id_bumper, std::string("bumpers"));
-  n.param("sonar_frame", frame_id_sonar, std::string("sonar"));
-
-  // advertise services for data topics
-  // second argument to advertise() is queue size.
-  // other argmuments (optional) are callbacks, or a boolean "latch" flag (whether to send current data to new
-  // subscribers when they subscribe).
-  // See ros::NodeHandle API docs.
-  pose_pub = n.advertise<nav_msgs::Odometry>("pose",1000);
-  bumpers_pub = n.advertise<rosaria::BumperState>("bumper_state",1000);
-  sonar_pub = n.advertise<sensor_msgs::PointCloud>("sonar", 50, 
-      boost::bind(&RosAriaNode::sonarConnectCb, this),
-      boost::bind(&RosAriaNode::sonarConnectCb, this));
-  sonar_pointcloud2_pub = n.advertise<sensor_msgs::PointCloud2>("sonar_pointcloud2", 50,
-      boost::bind(&RosAriaNode::sonarConnectCb, this),
-      boost::bind(&RosAriaNode::sonarConnectCb, this));
-
-  voltage_pub = n.advertise<std_msgs::Float64>("battery_voltage", 1000);
-  recharge_state_pub = n.advertise<std_msgs::Int8>("battery_recharge_state", 5, true /*latch*/ );
-  recharge_state.data = -2;
-  state_of_charge_pub = n.advertise<std_msgs::Float32>("battery_state_of_charge", 100);
-
-  motors_state_pub = n.advertise<std_msgs::Bool>("motors_state", 5, true /*latch*/ );
-  motors_state.data = false;
-  published_motors_state = false;
-
-  // advertise enable/disable services
-  enable_srv = n.advertiseService("enable_motors", &RosAriaNode::enable_motors_cb, this);
-  disable_srv = n.advertiseService("disable_motors", &RosAriaNode::disable_motors_cb, this);
-  
-  veltime = ros::Time::now();
-}
-
-RosAriaNode::~RosAriaNode()
-{
-  // disable motors and sonar.
-  robot->disableMotors();
-  robot->disableSonar();
-
-  robot->stopRunning();
-  robot->waitForRunExit();
-  Aria::shutdown();
 }
 
 int RosAriaNode::Setup()
